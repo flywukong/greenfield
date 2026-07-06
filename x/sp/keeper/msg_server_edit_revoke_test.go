@@ -117,3 +117,60 @@ func (s *KeeperTestSuite) TestEditStorageProviderRejectsIdentityOwnedByAnotherSP
 	s.Require().True(found)
 	s.Require().Equal(victim.Id, got.Id)
 }
+
+// TestPruneStaleSecondaryIndexes verifies the upgrade-time cleanup removes stale
+// seal/bls index entries left by historical rotations while keeping current ones.
+func (s *KeeperTestSuite) TestPruneStaleSecondaryIndexes() {
+	oldSeal := sample.RandAccAddress()
+	approval := sample.RandAccAddress()
+	gc := sample.RandAccAddress()
+	oldBls, _ := sample.RandBlsPubKeyAndBlsProof()
+
+	sp, err := types.NewStorageProvider(
+		1, sample.RandAccAddress(), sample.RandAccAddress(),
+		oldSeal, approval, gc, sample.RandAccAddress(),
+		sdkmath.NewInt(1), "https://sp.example", types.NewDescription("sp", "", "", ""), oldBls,
+	)
+	s.Require().NoError(err)
+	s.spKeeper.SetStorageProvider(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderBySealAddr(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderByApprovalAddr(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderByGcAddr(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderByBlsKey(s.ctx, &sp)
+
+	// Reproduce the pre-fix stale state: rotate the record and write the new index
+	// entries without revoking the old ones.
+	newSeal := sample.RandAccAddress()
+	newBls, _ := sample.RandBlsPubKeyAndBlsProof()
+	newBlsBz, _ := hex.DecodeString(newBls)
+	sp.SealAddress = newSeal.String()
+	sp.BlsKey = newBlsBz
+	s.spKeeper.SetStorageProvider(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderBySealAddr(s.ctx, &sp)
+	s.spKeeper.SetStorageProviderByBlsKey(s.ctx, &sp)
+
+	// Sanity: the stale old seal still resolves before pruning (the bug).
+	_, found := s.spKeeper.GetStorageProviderBySealAddr(s.ctx, oldSeal)
+	s.Require().True(found)
+
+	removed := s.spKeeper.PruneStaleSecondaryIndexes(s.ctx)
+	s.Require().Equal(2, removed, "only the stale seal and bls entries should be removed")
+
+	// Stale entries gone.
+	_, found = s.spKeeper.GetStorageProviderBySealAddr(s.ctx, oldSeal)
+	s.Require().False(found)
+	oldBlsBz, _ := hex.DecodeString(oldBls)
+	_, found = s.spKeeper.GetStorageProviderByBlsKey(s.ctx, oldBlsBz)
+	s.Require().False(found)
+
+	// Current entries preserved.
+	got, found := s.spKeeper.GetStorageProviderBySealAddr(s.ctx, newSeal)
+	s.Require().True(found)
+	s.Require().Equal(sp.Id, got.Id)
+	_, found = s.spKeeper.GetStorageProviderByBlsKey(s.ctx, newBlsBz)
+	s.Require().True(found)
+	_, found = s.spKeeper.GetStorageProviderByApprovalAddr(s.ctx, approval)
+	s.Require().True(found)
+	_, found = s.spKeeper.GetStorageProviderByGcAddr(s.ctx, gc)
+	s.Require().True(found)
+}

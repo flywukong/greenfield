@@ -1,6 +1,8 @@
 package keeper
 
 import (
+	"bytes"
+
 	storetypes "github.com/cosmos/cosmos-sdk/store/types"
 	sdk "github.com/cosmos/cosmos-sdk/types"
 
@@ -157,4 +159,44 @@ func (k Keeper) GetStorageProviderByBlsKey(ctx sdk.Context, blsPk []byte) (sp *t
 		return sp, false
 	}
 	return k.GetStorageProvider(ctx, k.spSequence.DecodeSequence(id))
+}
+
+// PruneStaleSecondaryIndexes removes seal/approval/gc/bls secondary-index entries
+// whose key no longer matches the current operational identity of the SP they
+// resolve to. It repairs stale bindings left by historical EditStorageProvider
+// calls that wrote the new index without revoking the previous one, and drops
+// orphan entries whose SP no longer exists. Intended to run once in an upgrade
+// handler; safe to re-run (idempotent).
+func (k Keeper) PruneStaleSecondaryIndexes(ctx sdk.Context) (removed int) {
+	store := ctx.KVStore(k.storeKey)
+
+	indexes := []struct {
+		prefix  []byte
+		current func(sp *types.StorageProvider) []byte
+	}{
+		{types.StorageProviderBySealAddrKey, func(sp *types.StorageProvider) []byte { return sp.GetSealAccAddress().Bytes() }},
+		{types.StorageProviderByApprovalAddrKey, func(sp *types.StorageProvider) []byte { return sp.GetApprovalAccAddress().Bytes() }},
+		{types.StorageProviderByGcAddrKey, func(sp *types.StorageProvider) []byte { return sp.GetGcAccAddress().Bytes() }},
+		{types.StorageProviderByBlsPubKeyKey, func(sp *types.StorageProvider) []byte { return sp.GetBlsKey() }},
+	}
+
+	for _, idx := range indexes {
+		var staleKeys [][]byte
+		iter := storetypes.KVStorePrefixIterator(store, idx.prefix)
+		for ; iter.Valid(); iter.Next() {
+			keyID := append([]byte(nil), iter.Key()...)
+			indexedValue := keyID[len(idx.prefix):]
+			sp, found := k.GetStorageProvider(ctx, k.spSequence.DecodeSequence(iter.Value()))
+			if !found || !bytes.Equal(indexedValue, idx.current(sp)) {
+				staleKeys = append(staleKeys, keyID)
+			}
+		}
+		iter.Close()
+
+		for _, key := range staleKeys {
+			store.Delete(key)
+			removed++
+		}
+	}
+	return removed
 }
